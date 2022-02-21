@@ -14,7 +14,7 @@
 // known address. AMDGPUMachineFunction allocates the LDS global.
 //
 // Local variables with constant annotation or non-undef initializer are passed
-// through unchanged for simplication or error diagnostics in later passes.
+// through unchanged for simplification or error diagnostics in later passes.
 //
 // To reduce the memory overhead variables that are only used by kernels are
 // excluded from this transform. The analysis to determine whether a variable
@@ -28,7 +28,7 @@
 
 #include "AMDGPU.h"
 #include "Utils/AMDGPUBaseInfo.h"
-#include "Utils/AMDGPULDSUtils.h"
+#include "Utils/AMDGPUMemoryUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -112,11 +112,9 @@ class AMDGPULowerModuleLDS : public ModulePass {
   removeFromUsedLists(Module &M,
                       const std::vector<GlobalVariable *> &LocalVars) {
     SmallPtrSet<Constant *, 32> LocalVarsSet;
-    for (size_t I = 0; I < LocalVars.size(); I++) {
-      if (Constant *C = dyn_cast<Constant>(LocalVars[I]->stripPointerCasts())) {
+    for (GlobalVariable *LocalVar : LocalVars)
+      if (Constant *C = dyn_cast<Constant>(LocalVar->stripPointerCasts()))
         LocalVarsSet.insert(C);
-      }
-    }
     removeFromUsedList(M, "llvm.used", LocalVarsSet);
     removeFromUsedList(M, "llvm.compiler.used", LocalVarsSet);
   }
@@ -166,8 +164,8 @@ public:
 
   bool runOnModule(Module &M) override {
     UsedList = getUsedList(M);
-
-    bool Changed = processUsedLDS(M);
+    bool Changed = superAlignLDSGlobals(M);
+    Changed |= processUsedLDS(M);
 
     for (Function &F : M.functions()) {
       if (F.isDeclaration())
@@ -184,6 +182,50 @@ public:
   }
 
 private:
+  // Increase the alignment of LDS globals if necessary to maximise the chance
+  // that we can use aligned LDS instructions to access them.
+  static bool superAlignLDSGlobals(Module &M) {
+    const DataLayout &DL = M.getDataLayout();
+    bool Changed = false;
+    if (!SuperAlignLDSGlobals) {
+      return Changed;
+    }
+
+    for (auto &GV : M.globals()) {
+      if (GV.getType()->getPointerAddressSpace() != AMDGPUAS::LOCAL_ADDRESS) {
+        // Only changing alignment of LDS variables
+        continue;
+      }
+      if (!GV.hasInitializer()) {
+        // cuda/hip extern __shared__ variable, leave alignment alone
+        continue;
+      }
+
+      Align Alignment = AMDGPU::getAlign(DL, &GV);
+      TypeSize GVSize = DL.getTypeAllocSize(GV.getValueType());
+
+      if (GVSize > 8) {
+        // We might want to use a b96 or b128 load/store
+        Alignment = std::max(Alignment, Align(16));
+      } else if (GVSize > 4) {
+        // We might want to use a b64 load/store
+        Alignment = std::max(Alignment, Align(8));
+      } else if (GVSize > 2) {
+        // We might want to use a b32 load/store
+        Alignment = std::max(Alignment, Align(4));
+      } else if (GVSize > 1) {
+        // We might want to use a b16 load/store
+        Alignment = std::max(Alignment, Align(2));
+      }
+
+      if (Alignment != AMDGPU::getAlign(DL, &GV)) {
+        Changed = true;
+        GV.setAlignment(Alignment);
+      }
+    }
+    return Changed;
+  }
+
   bool processUsedLDS(Module &M, Function *F = nullptr) {
     LLVMContext &Ctx = M.getContext();
     const DataLayout &DL = M.getDataLayout();
@@ -195,31 +237,6 @@ private:
     if (FoundLocalVars.empty()) {
       // No variables to rewrite, no changes made.
       return false;
-    }
-
-    // Increase the alignment of LDS globals if necessary to maximise the chance
-    // that we can use aligned LDS instructions to access them.
-    if (SuperAlignLDSGlobals) {
-      for (auto *GV : FoundLocalVars) {
-        Align Alignment = AMDGPU::getAlign(DL, GV);
-        TypeSize GVSize = DL.getTypeAllocSize(GV->getValueType());
-
-        if (GVSize > 8) {
-          // We might want to use a b96 or b128 load/store
-          Alignment = std::max(Alignment, Align(16));
-        } else if (GVSize > 4) {
-          // We might want to use a b64 load/store
-          Alignment = std::max(Alignment, Align(8));
-        } else if (GVSize > 2) {
-          // We might want to use a b32 load/store
-          Alignment = std::max(Alignment, Align(4));
-        } else if (GVSize > 1) {
-          // We might want to use a b16 load/store
-          Alignment = std::max(Alignment, Align(2));
-        }
-
-        GV->setAlignment(Alignment);
-      }
     }
 
     SmallVector<OptimizedStructLayoutField, 8> LayoutFields;

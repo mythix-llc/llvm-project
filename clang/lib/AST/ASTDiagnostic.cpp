@@ -38,6 +38,11 @@ QualType clang::desugarForDiagnostic(ASTContext &Context, QualType QT,
       QT = ET->desugar();
       continue;
     }
+    // ... or a using type ...
+    if (const UsingType *UT = dyn_cast<UsingType>(Ty)) {
+      QT = UT->desugar();
+      continue;
+    }
     // ... or a paren type ...
     if (const ParenType *PT = dyn_cast<ParenType>(Ty)) {
       QT = PT->desugar();
@@ -335,7 +340,7 @@ ConvertTypeToDiagnosticString(ASTContext &Context, QualType Ty,
       OS << "'" << S << "' (vector of " << VTy->getNumElements() << " '"
          << VTy->getElementType().getAsString(Context.getPrintingPolicy())
          << "' " << Values << ")";
-      return OS.str();
+      return DecoratedString;
     }
   }
 
